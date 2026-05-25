@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/zerodpi-core",
+    "crates/zerodpi-platform",
+    "crates/zerodpi",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+authors = ["ZeroDPI contributors"]
+repository = "https://github.com/mhdr/ZeroDPI"
+description = "Cross-platform DPI bypass via SNI spoofing (Rust port of patterniha/SNI-Spoofing)"
+
+[workspace.dependencies]
+anyhow = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "sync", "time", "signal"] }
+clap = { version = "4", features = ["derive"] }
+dashmap = "6"
+etherparse = "0.20"
+parking_lot = "0.12"
+ratatui = "0.29"
+crossterm = "0.28"
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "std"] }
+tokio-rustls = "0.26"
+webpki-roots = "0.26"
+ipnet = "2"
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

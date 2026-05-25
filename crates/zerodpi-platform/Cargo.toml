@@ -1,0 +1,24 @@
+[package]
+name = "zerodpi-platform"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Platform packet-interception backends for ZeroDPI (WinDivert on Windows, NFQUEUE on Linux/Android)."
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+zerodpi-core = { path = "../zerodpi-core" }
+etherparse.workspace = true
+parking_lot.workspace = true
+
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+nfq = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windivert = "0.6"
+windivert-sys = "0.10"

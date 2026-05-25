@@ -1,0 +1,154 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Release tag to publish. Leave empty to create a manual-build tag."
+        required: false
+        type: string
+      release_name:
+        description: "Release title. Leave empty to use the tag."
+        required: false
+        type: string
+      prerelease:
+        description: "Mark manually triggered releases as pre-releases."
+        required: true
+        default: true
+        type: boolean
+      publish_release:
+        description: "Publish packaged executables to GitHub Releases."
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  WINDIVERT_VERSION: "2.2.2"
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+      release_name: ${{ steps.meta.outputs.release_name }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+      publish_release: ${{ steps.meta.outputs.publish_release }}
+    steps:
+      - name: Prepare release metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            release_tag="${{ github.ref_name }}"
+            release_name="${{ github.ref_name }}"
+            prerelease="false"
+            publish_release="true"
+          else
+            release_tag="${{ inputs.tag_name }}"
+            if [[ -z "$release_tag" ]]; then
+              release_tag="manual-build-${{ github.run_number }}"
+            fi
+
+            release_name="${{ inputs.release_name }}"
+            if [[ -z "$release_name" ]]; then
+              release_name="$release_tag"
+            fi
+
+            prerelease="${{ inputs.prerelease }}"
+            publish_release="${{ inputs.publish_release }}"
+          fi
+
+          {
+            echo "release_tag=$release_tag"
+            echo "release_name=$release_name"
+            echo "prerelease=$prerelease"
+            echo "publish_release=$publish_release"
+          } >> "$GITHUB_OUTPUT"
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libnetfilter-queue-dev
+
+      - name: Build Linux package
+        run: python3 build.py --platform linux
+
+      - name: Archive Linux package
+        run: tar -C dist/linux -czf zerodpi-linux-x86_64.tar.gz .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zerodpi-linux-x86_64
+          path: zerodpi-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-latest
+    env:
+      WINDIVERT_PATH: ${{ github.workspace }}\windivert
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Download WinDivert
+        shell: pwsh
+        run: |
+          $ver = $env:WINDIVERT_VERSION
+          $url = "https://github.com/basil00/WinDivert/releases/download/v$ver/WinDivert-$ver-A.zip"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\windivert.zip"
+          Expand-Archive -Path "$env:RUNNER_TEMP\windivert.zip" -DestinationPath "$env:RUNNER_TEMP\windivert-extract"
+
+          $extracted = Get-ChildItem "$env:RUNNER_TEMP\windivert-extract" -Directory | Select-Object -First 1
+          $archDir = Join-Path $extracted.FullName "x64"
+
+          New-Item -ItemType Directory -Force -Path $env:WINDIVERT_PATH | Out-Null
+          Copy-Item -Recurse -Force "$archDir\*" $env:WINDIVERT_PATH
+          Set-Content -Path "$env:WINDIVERT_PATH\.version" -Value $ver -NoNewline
+
+      - name: Build Windows package
+        run: python build.py --platform windows --toolchain ""
+
+      - name: Archive Windows package
+        shell: pwsh
+        run: Compress-Archive -Path "dist\windows\*" -DestinationPath "zerodpi-windows-x86_64.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zerodpi-windows-x86_64
+          path: zerodpi-windows-x86_64.zip
+          if-no-files-found: error
+
+  publish:
+    needs: [prepare, linux, windows]
+    runs-on: ubuntu-latest
+    if: needs.prepare.outputs.publish_release == 'true'
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.release_tag }}
+          name: ${{ needs.prepare.outputs.release_name }}
+          prerelease: ${{ needs.prepare.outputs.prerelease }}
+          generate_release_notes: true
+          files: |
+            dist/zerodpi-linux-x86_64/zerodpi-linux-x86_64.tar.gz
+            dist/zerodpi-windows-x86_64/zerodpi-windows-x86_64.zip
