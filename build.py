@@ -17,7 +17,7 @@ Linux:
      README.md to dist/linux/.
 
 Windows:
-  1. Verifies the repo-local windivert/ folder and sets WINDIVERT_PATH.
+  1. Downloads/verifies the repo-local windivert/ folder and sets WINDIVERT_PATH.
   2. Runs `cargo +<toolchain> build --workspace --release` (default toolchain:
      stable-x86_64-pc-windows-gnu). Pass --toolchain="" to use the workspace
      default toolchain instead.
@@ -39,6 +39,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -49,6 +50,7 @@ from pathlib import Path
 WINDIVERT_DEFAULT_VERSION = "2.2.2"
 WINDIVERT_VERSION_FILE = ".version"
 WINDIVERT_REQUIRED_FILES = ("WinDivert.dll", "WinDivert.lib", "WinDivert64.sys")
+WINDIVERT_RELEASE_URL = "https://github.com/basil00/WinDivert/releases/download/v{version}/WinDivert-{version}-A.zip"
 # On Windows this project targets the GNU toolchain by default.
 WINDOWS_DEFAULT_TOOLCHAIN = "stable-x86_64-pc-windows-gnu"
 # Default MSYS2 installation path; its mingw64/bin is prepended to PATH when
@@ -91,6 +93,7 @@ TERMUX_CLANG_TARGETS = {
 REPO_ROOT = Path(__file__).resolve().parent
 CARGO_RELEASE_DIR = REPO_ROOT / "target" / "release"
 COMMON_DIST_FILES = ("config.toml", "sni_list.txt", "ip_list.txt", "README.md")
+LINUX_DIST_FILES = ("install-systemd.sh",)
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +121,13 @@ def copy_required_file(src: Path, dest: Path) -> None:
 def copy_common_dist_files(dist_dir: Path) -> None:
     for filename in COMMON_DIST_FILES:
         copy_required_file(REPO_ROOT / filename, dist_dir / filename)
+
+
+def copy_linux_dist_files(dist_dir: Path) -> None:
+    for filename in LINUX_DIST_FILES:
+        dest = dist_dir / filename
+        copy_required_file(REPO_ROOT / filename, dest)
+        dest.chmod(0o755)
 
 
 def print_dist_contents(dist_dir: Path) -> None:
@@ -229,6 +239,7 @@ def build_linux() -> None:
 
     copy_required_file(binary, dist_dir / "zerodpi")
     copy_common_dist_files(dist_dir)
+    copy_linux_dist_files(dist_dir)
 
     print_dist_contents(dist_dir)
 
@@ -454,6 +465,7 @@ def build_linux_cross_zigbuild(targets: list[str], msys2_path: str | None = None
 
         copy_required_file(binary, dist_dir / "zerodpi")
         copy_common_dist_files(dist_dir)
+        copy_linux_dist_files(dist_dir)
 
         print_dist_contents(dist_dir)
 
@@ -470,14 +482,74 @@ def get_installed_windivert_version(dest_dir: Path) -> str | None:
     return None
 
 
+def missing_windivert_files(dest_dir: Path) -> list[str]:
+    """Return the required WinDivert files that are absent from dest_dir."""
+    return [name for name in WINDIVERT_REQUIRED_FILES if not (dest_dir / name).is_file()]
+
+
+def download_windivert(dest_dir: Path, version: str) -> None:
+    """Download and install WinDivert x64 runtime/link files into dest_dir."""
+    url = WINDIVERT_RELEASE_URL.format(version=version)
+    print(f"\nDownloading WinDivert {version} from:\n  {url}")
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+
+    try:
+        urllib.request.urlretrieve(url, tmp_path)
+        with zipfile.ZipFile(tmp_path, "r") as zf:
+            members = {Path(info.filename).as_posix(): info for info in zf.infolist()}
+            for filename in WINDIVERT_REQUIRED_FILES:
+                suffix = f"/x64/{filename}".lower()
+                matches = [
+                    info
+                    for name, info in members.items()
+                    if name.lower().endswith(suffix) and not info.is_dir()
+                ]
+                if not matches:
+                    die(f"Downloaded WinDivert archive does not contain x64/{filename}.")
+                with zf.open(matches[0]) as src, (dest_dir / filename).open("wb") as dst:
+                    shutil.copyfileobj(src, dst)
+
+        (dest_dir / WINDIVERT_VERSION_FILE).write_text(version + "\n", encoding="utf-8")
+        print(f"WinDivert {version} installed to: {dest_dir}")
+    except urllib.error.URLError as e:
+        die(f"Failed to download WinDivert {version}: {e}")
+    except zipfile.BadZipFile:
+        die(f"Downloaded WinDivert archive is not a valid zip file: {tmp_path}")
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def ensure_windivert(dest_dir: Path, expected_version: str) -> None:
+    """Download WinDivert when the repo-local copy is missing or stale."""
+    missing = missing_windivert_files(dest_dir)
+    installed = get_installed_windivert_version(dest_dir)
+    if missing:
+        print(
+            "\nLocal WinDivert files are missing from "
+            f"{dest_dir}:\n  " + "\n  ".join(missing)
+        )
+        download_windivert(dest_dir, expected_version)
+        return
+
+    if installed and installed != expected_version:
+        print(
+            f"\nLocal WinDivert version mismatch in {dest_dir} "
+            f"(installed: {installed}, expected: {expected_version})."
+        )
+        download_windivert(dest_dir, expected_version)
+
+
 def validate_local_windivert(dest_dir: Path, expected_version: str) -> None:
     """Verify the repo-local WinDivert files needed by windivert-sys exist."""
-    missing = [name for name in WINDIVERT_REQUIRED_FILES if not (dest_dir / name).is_file()]
+    missing = missing_windivert_files(dest_dir)
     if missing:
         die(
             "Local WinDivert files are missing from "
             f"{dest_dir}:\n  " + "\n  ".join(missing) +
-            "\nPlace the WinDivert x64 release files in the repo's windivert/ folder."
+            "\nAutomatic download failed. Place the WinDivert x64 release files in the repo's windivert/ folder."
         )
 
     installed = get_installed_windivert_version(dest_dir)
@@ -496,6 +568,7 @@ def build_windows(windivert_version: str, toolchain: str, msys2_path: str) -> No
     print("=== Building ZeroDPI for Windows ===")
 
     windivert_dir = REPO_ROOT / "windivert"
+    ensure_windivert(windivert_dir, windivert_version)
     validate_local_windivert(windivert_dir, windivert_version)
 
     # Build the cargo command, optionally prefixing with a toolchain specifier.
@@ -745,7 +818,7 @@ def main() -> None:
         "--windivert-version",
         default=WINDIVERT_DEFAULT_VERSION,
         metavar="VER",
-        help=f"Expected local WinDivert release (Windows only, default: {WINDIVERT_DEFAULT_VERSION})",
+        help=f"WinDivert release to download/verify (Windows only, default: {WINDIVERT_DEFAULT_VERSION})",
     )
     parser.add_argument(
         "--toolchain",

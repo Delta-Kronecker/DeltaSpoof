@@ -426,7 +426,7 @@ cargo build --release
 <details>
 <summary><b>Windows</b> (click to expand)</summary>
 
-Requires MSYS2, GNU toolchain, and the repo-local `windivert/` folder:
+Requires MSYS2 and the GNU toolchain. When using `build.py`, WinDivert is downloaded into the repo-local `windivert/` folder automatically.
 
 ```powershell
 cargo +stable-x86_64-pc-windows-gnu build --release

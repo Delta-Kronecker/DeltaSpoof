@@ -66,6 +66,9 @@ jobs:
       - name: Build Linux package
         run: python3 build.py --platform linux
 
+      - name: Verify Linux installer script
+        run: test -x dist/linux/install-systemd.sh
+
       - name: Archive Linux package
         run: tar -C dist/linux -czf zerodpi-linux-x86_64.tar.gz .
 
