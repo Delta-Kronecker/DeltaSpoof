@@ -1507,6 +1507,10 @@ async fn find_ip_cycle_manager(cmc: CycleManagerConfig) {
         cycle_num += 1;
         let mut dead_ips: Vec<IpAddr> = Vec::new();
 
+        // Reset per-cycle counters at the START of the cycle so all IPs (old + new) compete fairly.
+        cmc.byte_counters.reset_cycle_counters();
+        cmc.pool.write().unwrap().update_cycle_counts(cmc.cycle_secs);
+
         // First: evaluate using TOTAL lifetime bytes (not per-cycle).
         let active = cmc.pool.read().unwrap().active_ips().to_vec();
         let mut ip_stats: Vec<(IpAddr, u64, u64, u64)> = Vec::new();
@@ -1676,10 +1680,6 @@ async fn find_ip_cycle_manager(cmc: CycleManagerConfig) {
                 }
             }
         }
-
-        // Reset per-cycle counters and update cycle counts for the NEW cycle.
-        cmc.byte_counters.reset_cycle_counters();
-        cmc.pool.write().unwrap().update_cycle_counts(cmc.cycle_secs);
 
         info!(
             cycle = cycle_num,
