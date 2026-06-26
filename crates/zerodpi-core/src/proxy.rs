@@ -1536,6 +1536,14 @@ async fn find_ip_cycle_manager(cmc: CycleManagerConfig) {
             break;
         }
 
+        // Reset stats for this cycle.
+        {
+            let mut stats = cmc.stats.lock().unwrap();
+            stats.total_scanned = 0;
+            stats.total_successful = 0;
+            stats.total_removed = 0;
+        }
+
         cycle_num += 1;
         let mut dead_ips: Vec<IpAddr> = Vec::new();
 
