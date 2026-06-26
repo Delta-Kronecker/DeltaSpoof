@@ -1077,8 +1077,9 @@ pub struct IpPool {
     fixed_ip: Option<IpAddr>,
     next_idx: usize,
     start_times: std::collections::HashMap<IpAddr, std::time::Instant>,
-    /// How many cycle_manager cycles each IP has been in the pool.
     cycle_counts: std::collections::HashMap<IpAddr, u64>,
+    /// Saved cumulative bytes from all previous cycles: (upload, download).
+    saved_bytes: std::collections::HashMap<IpAddr, (u64, u64)>,
 }
 
 impl IpPool {
@@ -1086,12 +1087,14 @@ impl IpPool {
         let now = std::time::Instant::now();
         let start_times = initial_ips.iter().map(|&ip| (ip, now)).collect();
         let cycle_counts = initial_ips.iter().map(|&ip| (ip, 1u64)).collect();
+        let saved_bytes = initial_ips.iter().map(|&ip| (ip, (0u64, 0u64))).collect();
         Self {
             active: initial_ips,
             fixed_ip: None,
             next_idx: 0,
             start_times,
             cycle_counts,
+            saved_bytes,
         }
     }
 
@@ -1163,6 +1166,17 @@ impl IpPool {
                 self.cycle_counts.insert(*ip, cycles);
             }
         }
+    }
+
+    /// Get saved cumulative bytes from all previous cycles.
+    pub fn saved_bytes(&self, ip: &IpAddr) -> (u64, u64) {
+        self.saved_bytes.get(ip).copied().unwrap_or((0, 0))
+    }
+
+    /// Save cumulative bytes from current cycle before reset.
+    pub fn save_bytes(&mut self, ip: IpAddr, upload: u64, download: u64) {
+        let prev = self.saved_bytes.get(&ip).copied().unwrap_or((0, 0));
+        self.saved_bytes.insert(ip, (prev.0 + upload, prev.1 + download));
     }
 }
 
@@ -1679,8 +1693,14 @@ async fn find_ip_cycle_manager(cmc: CycleManagerConfig) {
             }
         }
 
-        // Reset per-cycle counters (↑/Cycle, ↓/Cycle) AFTER new IPs are added.
-        // Cumulative Total is NEVER reset — it tracks lifetime activity.
+        // Save current cycle values before reset, then reset per-cycle counters.
+        {
+            let active = cmc.pool.read().unwrap().active_ips().to_vec();
+            for ip in &active {
+                let (upload, download) = cmc.byte_counters.total_bytes(ip);
+                cmc.pool.write().unwrap().save_bytes(*ip, upload, download);
+            }
+        }
         cmc.byte_counters.reset_cycle_counters();
         cmc.pool.write().unwrap().update_cycle_counts(cmc.cycle_secs);
 

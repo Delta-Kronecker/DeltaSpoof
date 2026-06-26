@@ -3068,7 +3068,7 @@ pub fn run_top_ip_selection(
     pool: &std::sync::Arc<std::sync::RwLock<zerodpi_core::proxy::IpPool>>,
     byte_counters: &zerodpi_core::proxy::IpByteCounters,
 ) -> anyhow::Result<IpAddr> {
-    // Build stats for ALL IPs that have ever been used (from byte_counters).
+    // Build stats using saved cumulative bytes + current cycle bytes.
     #[allow(clippy::type_complexity)]
     let mut all_ips: Vec<(IpAddr, u64, u64, u64, u64, u64, u64, u64)> = {
         let p = pool.read().unwrap();
@@ -3081,7 +3081,10 @@ pub fn run_top_ip_selection(
         ips.into_iter().map(|ip| {
             let cycle_up = byte_counters.cycle_upload_bytes(&ip);
             let cycle_down = byte_counters.cycle_download_bytes(&ip);
-            let (total_up, total_down) = byte_counters.total_bytes(&ip);
+            let (saved_up, saved_down) = p.saved_bytes(&ip);
+            let (cur_up, cur_down) = byte_counters.total_bytes(&ip);
+            let total_up = saved_up + cur_up;
+            let total_down = saved_down + cur_down;
             let cycles = p.cycle_count(&ip);
             (ip, cycle_up, cycle_down, total_up, total_down, total_up + total_down, cycles, total_up + total_down)
         }).collect()

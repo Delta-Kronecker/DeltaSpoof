@@ -68,7 +68,7 @@ IP_LIST = "ip_list.txt"
 
 # Maximum time (in seconds) each individual probe may take before
 # it is abandoned.
-SCAN_TIMEOUT_SECS = 5
+SCAN_TIMEOUT_SECS = 10
 
 # How often (in seconds) ZeroDPI re-runs the full SNI scan in the background
 # while the proxy is running. In sni_spoof mode, a better top result switches
