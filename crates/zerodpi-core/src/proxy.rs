@@ -1525,8 +1525,84 @@ async fn find_ip_cycle_manager(cmc: CycleManagerConfig) {
     let cycle_interval = Duration::from_secs(cmc.cycle_secs);
 
     // Pre-scanned candidates (sorted by score desc).
-    // Start with empty list — will be populated by the first scan in the loop.
     let mut pre_scanned: Vec<IpProbeEntry> = Vec::new();
+
+    // Run scan ONCE at startup to populate candidates.
+    {
+        let mut candidates = cmc.candidate_ips.clone();
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        candidates.sort_by_key(|ip| {
+            let mut h = DefaultHasher::new();
+            ip.hash(&mut h);
+            seed.wrapping_add(h.finish())
+        });
+        let scan_limit = (cmc.max_ip * 20).min(candidates.len());
+        candidates.truncate(scan_limit);
+
+        let (scan_tx, mut scan_rx) = mpsc::unbounded_channel::<IpScanEvent>();
+        let scan_cfg = cmc.cfg.clone();
+        let scan_sni = cmc.scan_sni.clone();
+        let scan_timeout = cmc.scan_timeout;
+        let scan_candidates = candidates.clone();
+
+        let scan_handle = tokio::spawn(async move {
+            scan_ip_list(scan_candidates, scan_sni, scan_timeout, scan_cfg, Some(scan_tx)).await
+        });
+
+        let mut scan_done = false;
+        let mut all_scan_results: Vec<IpProbeEntry> = Vec::new();
+        let mut tcp_tested: usize = 0;
+
+        while !scan_done {
+            if scan_handle.is_finished() {
+                scan_done = true;
+                while let Ok(event) = scan_rx.try_recv() {
+                    match event {
+                        IpScanEvent::TcpDone { tcp_tested: t } => { tcp_tested = t; }
+                        IpScanEvent::ProbeComplete(entry) => { all_scan_results.push(entry); }
+                    }
+                }
+            } else {
+                tokio::time::sleep(Duration::from_millis(2000)).await;
+                while let Ok(event) = scan_rx.try_recv() {
+                    match event {
+                        IpScanEvent::TcpDone { tcp_tested: t } => { tcp_tested = t; }
+                        IpScanEvent::ProbeComplete(entry) => { all_scan_results.push(entry); }
+                    }
+                }
+            }
+
+            // Update stats.
+            {
+                let mut stats = cmc.stats.lock().unwrap();
+                stats.total_scanned = tcp_tested as u64;
+                stats.total_successful = all_scan_results.iter().filter(|e| e.score > 0).count() as u64;
+            }
+        }
+
+        // Fill pool from scan results.
+        {
+            let mut p = cmc.pool.write().unwrap();
+            for entry in &all_scan_results {
+                if p.active_count() >= cmc.max_ip {
+                    pre_scanned.push(entry.clone());
+                    continue;
+                }
+                p.add_ip(entry.ip);
+                if let Some(ref tx) = cmc.find_ip_event_tx {
+                    let _ = tx.send(FindIpEvent::IpAdded { ip: entry.ip, score: entry.score });
+                }
+            }
+            pre_scanned.sort_by_key(|b| std::cmp::Reverse(b.score));
+        }
+
+        info!(total = all_scan_results.len(), pool = cmc.pool.read().unwrap().active_count(), pre_scanned = pre_scanned.len(), "find_ip: initial scan complete");
+    }
 
     loop {
         tokio::time::sleep(cycle_interval).await;
@@ -1591,12 +1667,11 @@ async fn find_ip_cycle_manager(cmc: CycleManagerConfig) {
             cmc.stats.lock().unwrap().total_removed += dead_ips.len() as u64;
         }
 
-        // Replace dead IPs — use pre_scanned first (fast), then scan if needed.
+        // Replace dead IPs from pre_scanned cache (no new scan).
         let mut replaced_count = 0usize;
         {
             let mut p = cmc.pool.write().unwrap();
             let active_now: Vec<IpAddr> = p.active_ips().to_vec();
-            // First: fill from pre_scanned cache.
             pre_scanned.retain(|entry| {
                 if p.active_count() >= cmc.max_ip {
                     return true;
@@ -1613,107 +1688,6 @@ async fn find_ip_cycle_manager(cmc: CycleManagerConfig) {
                     true
                 }
             });
-        }
-
-        // If pool still needs IPs, run scan incrementally.
-        if cmc.pool.read().unwrap().active_count() < cmc.max_ip {
-            let mut candidates = cmc.candidate_ips.clone();
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let seed = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64;
-            candidates.sort_by_key(|ip| {
-                let mut h = DefaultHasher::new();
-                ip.hash(&mut h);
-                seed.wrapping_add(h.finish())
-            });
-            let scan_limit = (cmc.max_ip * 20).min(candidates.len());
-            candidates.truncate(scan_limit);
-
-            let (scan_tx, mut scan_rx) = mpsc::unbounded_channel::<IpScanEvent>();
-            let scan_cfg = cmc.cfg.clone();
-            let scan_sni = cmc.scan_sni.clone();
-            let scan_timeout = cmc.scan_timeout;
-            let scan_candidates = candidates.clone();
-
-            let scan_handle = tokio::spawn(async move {
-                scan_ip_list(scan_candidates, scan_sni, scan_timeout, scan_cfg, Some(scan_tx)).await
-            });
-
-            let mut scan_done = false;
-            let mut all_scan_results: Vec<IpProbeEntry> = Vec::new();
-            let mut tcp_tested: usize = 0;
-            let mut prev_tcp: usize = 0;
-            let mut prev_ok: usize = 0;
-
-            while !scan_done {
-                if scan_handle.is_finished() {
-                    scan_done = true;
-                    while let Ok(event) = scan_rx.try_recv() {
-                        match event {
-                            IpScanEvent::TcpDone { tcp_tested: t } => { tcp_tested = t; }
-                            IpScanEvent::ProbeComplete(entry) => { all_scan_results.push(entry); }
-                        }
-                    }
-                } else {
-                    tokio::time::sleep(Duration::from_millis(2000)).await;
-                    while let Ok(event) = scan_rx.try_recv() {
-                        match event {
-                            IpScanEvent::TcpDone { tcp_tested: t } => { tcp_tested = t; }
-                            IpScanEvent::ProbeComplete(entry) => { all_scan_results.push(entry); }
-                        }
-                    }
-                }
-
-                // Update stats with DELTA only.
-                let cur_ok = all_scan_results.iter().filter(|e| e.score > 0).count();
-                let delta_tcp = tcp_tested.saturating_sub(prev_tcp);
-                let delta_ok = cur_ok.saturating_sub(prev_ok);
-                {
-                    let mut stats = cmc.stats.lock().unwrap();
-                    stats.total_scanned += delta_tcp as u64;
-                    stats.total_successful += delta_ok as u64;
-                }
-                prev_tcp = tcp_tested;
-                prev_ok = cur_ok;
-
-                // Add best IPs to pool immediately.
-                if cmc.pool.read().unwrap().is_fixed() {
-                    scan_handle.abort();
-                    break;
-                }
-
-                {
-                    let mut p = cmc.pool.write().unwrap();
-                    let active_now: Vec<IpAddr> = p.active_ips().to_vec();
-                    for entry in &all_scan_results {
-                        if p.active_count() >= cmc.max_ip {
-                            if !active_now.contains(&entry.ip) && !pre_scanned.iter().any(|e| e.ip == entry.ip) {
-                                pre_scanned.push(entry.clone());
-                            }
-                            continue;
-                        }
-                        if !active_now.contains(&entry.ip) && !pre_scanned.iter().any(|e| e.ip == entry.ip) {
-                            p.add_ip(entry.ip);
-                            replaced_count += 1;
-                            info!(ip = %entry.ip, score = entry.score, "find_ip: added replacement IP from scan");
-                            if let Some(ref tx) = cmc.find_ip_event_tx {
-                                let _ = tx.send(FindIpEvent::IpAdded { ip: entry.ip, score: entry.score });
-                            }
-                        } else if !active_now.contains(&entry.ip) {
-                            pre_scanned.push(entry.clone());
-                        }
-                    }
-                    pre_scanned.sort_by_key(|b| std::cmp::Reverse(b.score));
-                }
-
-                if cmc.pool.read().unwrap().active_count() >= cmc.max_ip {
-                    scan_handle.abort();
-                    break;
-                }
-            }
         }
 
         // Save current cycle values, then reset ALL counters (including Total).
