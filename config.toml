@@ -31,7 +31,7 @@ LISTEN_PORT = 40443
 # - "proxy_scan"    — scan sni_list.txt (Phase 1), then test each working SNI
 #                     through your V2RayN SOCKS5 mixed port (Phase 2); display
 #                     blended results and exit.  Requires V2RayN to be running.
-MODE = "find_ip"
+MODE = "auto_spoof"
 
 # When true, ZeroDPI automatically picks the highest-ranked candidate
 # after scanning instead of showing the manual selection table.

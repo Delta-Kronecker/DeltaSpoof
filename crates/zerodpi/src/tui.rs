@@ -2980,8 +2980,7 @@ pub fn run_find_ip_dashboard(
 ) -> anyhow::Result<FindIpAction> {
     let (sni, domain_ip, max_ip) = match info {
         DashboardInfo::FindIp { sni, domain_ip, max_ip } => (sni.clone(), *domain_ip, *max_ip),
-        DashboardInfo::AutoSpoof { domains, max_ip, .. } => (domains.first().cloned().unwrap_or_default(), Ipv4Addr::new(0,0,0,0), *max_ip),
-        _ => anyhow::bail!("run_find_ip_dashboard called with non-FindIp/AutoSpoof info"),
+        _ => anyhow::bail!("run_find_ip_dashboard called with non-FindIp info"),
     };
 
     let start = Instant::now();
@@ -3056,7 +3055,7 @@ pub fn run_find_ip_dashboard(
 
 #[allow(clippy::too_many_arguments)]
 fn draw_find_ip_live(
-    terminal: &mut Term, sni: &str, _domain_ip: Ipv4Addr, max_ip: usize,
+    terminal: &mut Term, sni: &str, domain_ip: Ipv4Addr, max_ip: usize,
     active_count: usize, is_fixed: bool,
     ip_rows: &[(IpAddr, u64, u64, u64, u64, u64, Duration)],
     start: Instant,
@@ -3262,6 +3261,138 @@ pub fn run_top_ip_selection(
                     KeyCode::Enter => return Ok(all_ips[state.selected().unwrap_or(0)].0),
                     KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(all_ips[0].0),
                     _ => {}
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AutoSpoof live dashboard
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoSpoofAction {
+    Quit,
+}
+
+pub fn run_auto_spoof_dashboard(
+    terminal: &mut Term,
+    proxy_rx: &mut mpsc::UnboundedReceiver<ProxyEvent>,
+    _find_ip_rx: &mut mpsc::UnboundedReceiver<FindIpEvent>,
+    domains: &[String],
+    max_ip: usize,
+    cfg: &Config,
+    pool: &std::sync::Arc<std::sync::RwLock<zerodpi_core::proxy::IpPool>>,
+    byte_counters: &zerodpi_core::proxy::IpByteCounters,
+) -> anyhow::Result<AutoSpoofAction> {
+    let start = Instant::now();
+    let max_domain = domains.len();
+    let total_connections = max_ip * max_domain;
+
+    loop {
+        loop {
+            match proxy_rx.try_recv() {
+                Ok(_) => {}
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+        loop {
+            match _find_ip_rx.try_recv() {
+                Ok(_) => {}
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+
+        let (active_ips, cycle_active_count) = {
+            let p = pool.read().unwrap();
+            (p.active_ips().to_vec(), p.active_count())
+        };
+
+        let mut rows: Vec<(String, IpAddr, u64, u64, u64, u64, Duration)> = Vec::new();
+        for &ip in &active_ips {
+            let conns = byte_counters.connection_count(&ip);
+            let (total_up, total_down) = byte_counters.total_bytes(&ip);
+            let total = total_up + total_down;
+            let duration = {
+                let p = pool.read().unwrap();
+                p.start_time(&ip).elapsed()
+            };
+            for domain in domains {
+                rows.push((domain.clone(), ip, total_up, total_down, total, conns, duration));
+            }
+        }
+
+        let uptime = fmt_uptime(start.elapsed());
+
+        terminal.draw(|frame| {
+            let area = frame.area();
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .margin(1)
+                .constraints([Constraint::Length(4), Constraint::Min(5), Constraint::Length(3)])
+                .split(area);
+
+            let header_lines = vec![
+                Line::from(vec![
+                    Span::styled("Mode: ", label_style()),
+                    Span::styled("auto_spoof", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Span::raw("   "),
+                    Span::styled("Domains: ", label_style()),
+                    Span::styled(max_domain.to_string(), Style::default().fg(Color::Cyan)),
+                    Span::raw("   "),
+                    Span::styled("IPs: ", label_style()),
+                    Span::styled(max_ip.to_string(), Style::default().fg(Color::Cyan)),
+                    Span::raw("   "),
+                    Span::styled("Connections: ", label_style()),
+                    Span::styled(total_connections.to_string(), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                    Span::raw("   "),
+                    Span::styled("Uptime: ", label_style()),
+                    Span::styled(uptime, Style::default().fg(Color::White)),
+                ]),
+            ];
+            frame.render_widget(Paragraph::new(header_lines).block(Block::default().borders(Borders::ALL).title(" DeltaSpoof — AutoSpoof Dashboard ")), chunks[0]);
+
+            let table_rows: Vec<Row> = rows.iter().map(|(domain, ip, cup, cdown, total, conns, duration)| {
+                let ip_style = if *total == 0 {
+                    Style::default().fg(Color::Red)
+                } else {
+                    Style::default().fg(Color::Green)
+                };
+                let conn_str = format!("{}:{}", domain, ip);
+                Row::new(vec![
+                    Cell::from(conn_str).style(ip_style.add_modifier(Modifier::BOLD)),
+                    Cell::from(format!("{}/C", fmt_bytes(*cup))).style(Style::default().fg(Color::Cyan)),
+                    Cell::from(format!("{}/C", fmt_bytes(*cdown))).style(Style::default().fg(Color::Green)),
+                    Cell::from(fmt_bytes(*total)).style(Style::default().fg(Color::Yellow)),
+                    Cell::from(conns.to_string()),
+                    Cell::from(fmt_uptime(*duration)),
+                ])
+            }).collect();
+
+            let widths = [Constraint::Min(30), Constraint::Length(12), Constraint::Length(12), Constraint::Length(10), Constraint::Length(8), Constraint::Min(8)];
+            let table = Table::new(table_rows, widths)
+                .header(Row::new(vec!["Connection (domain:IP)", "↑/Cycle", "↓/Cycle", "Total", "Conns", "Duration"]).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)))
+                .block(Block::default().borders(Borders::ALL).title(format!(" Active Connections ({}) ", cycle_active_count)));
+            frame.render_widget(table, chunks[1]);
+
+            let footer = Paragraph::new(Line::from(vec![
+                Span::styled("q/Esc", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                Span::styled(" quit", label_style()),
+            ])).block(Block::default().borders(Borders::ALL));
+            frame.render_widget(footer, chunks[2]);
+        })?;
+
+        if event::poll(Duration::from_millis(200))? {
+            if let Event::Key(k) = event::read()? {
+                if k.kind == KeyEventKind::Press {
+                    match k.code {
+                        KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => return Ok(AutoSpoofAction::Quit),
+                        KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => return Ok(AutoSpoofAction::Quit),
+                        _ => {}
+                    }
                 }
             }
         }

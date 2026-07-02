@@ -1749,17 +1749,13 @@ fn auto_spoof_main(
         }
 
         loop {
-            let dash_info = tui::DashboardInfo::AutoSpoof {
-                domains: domain_names.clone(),
-                max_ip,
-                max_domain: domain_names.len(),
-            };
             let mut terminal = tui::enter_tui()?;
-            let dash_action = tui::run_find_ip_dashboard(
+            let dash_action = tui::run_auto_spoof_dashboard(
                 &mut terminal,
                 &mut event_rx,
                 &mut find_ip_event_rx,
-                &dash_info,
+                &domain_names,
+                max_ip,
                 &cfg,
                 &pool,
                 &byte_counters,
@@ -1767,23 +1763,10 @@ fn auto_spoof_main(
             tui::leave_tui(terminal)?;
 
             match dash_action {
-                Ok(tui::FindIpAction::Quit) => {
+                Ok(tui::AutoSpoofAction::Quit) => {
                     if let Some(h) = proxy_handle.take() { h.abort(); }
                     info!("auto_spoof: shutting down");
                     return Ok(());
-                }
-                Ok(tui::FindIpAction::ChangeDomain) => {
-                    if let Some(h) = proxy_handle.take() { h.abort(); }
-                    info!("auto_spoof: changing domains");
-                    break;
-                }
-                Ok(tui::FindIpAction::ChangeRange) => {
-                    if let Some(h) = proxy_handle.take() { h.abort(); }
-                    info!("auto_spoof: changing range");
-                    break;
-                }
-                Ok(tui::FindIpAction::StopAndPick) => {
-                    info!("auto_spoof: IP picking not applicable in auto mode");
                 }
                 Err(e) => {
                     if let Some(h) = proxy_handle.take() { h.abort(); }
