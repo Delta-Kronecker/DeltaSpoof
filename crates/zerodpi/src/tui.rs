@@ -2980,7 +2980,8 @@ pub fn run_find_ip_dashboard(
 ) -> anyhow::Result<FindIpAction> {
     let (sni, domain_ip, max_ip) = match info {
         DashboardInfo::FindIp { sni, domain_ip, max_ip } => (sni.clone(), *domain_ip, *max_ip),
-        _ => anyhow::bail!("run_find_ip_dashboard called with non-FindIp info"),
+        DashboardInfo::AutoSpoof { domains, max_ip, .. } => (domains.first().cloned().unwrap_or_default(), Ipv4Addr::new(0,0,0,0), *max_ip),
+        _ => anyhow::bail!("run_find_ip_dashboard called with non-FindIp/AutoSpoof info"),
     };
 
     let start = Instant::now();
