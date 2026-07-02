@@ -127,6 +127,12 @@ pub enum DashboardInfo {
         domain_ip: Ipv4Addr,
         max_ip: usize,
     },
+    /// Auto-spoof mode: multi-domain with live IP pool.
+    AutoSpoof {
+        domains: Vec<String>,
+        max_ip: usize,
+        max_domain: usize,
+    },
 }
 
 /// Action returned by the find_ip dashboard.
@@ -396,6 +402,117 @@ pub fn run_selection(
                     KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
                         // Default to rank-1.
                         return Ok(entries[0].clone());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// Multi-domain selection: user can toggle domains with space, confirm with Enter.
+pub fn run_multi_domain_selection(
+    terminal: &mut Term,
+    entries: &[SniProbeEntry],
+    max_domain: usize,
+) -> anyhow::Result<Vec<SniProbeEntry>> {
+    if entries.is_empty() {
+        anyhow::bail!("no SNI candidates to select from");
+    }
+    let limit = max_domain.min(entries.len());
+
+    let mut state = TableState::default();
+    state.select(Some(0));
+    let mut selected: Vec<bool> = vec![false; entries.len()];
+
+    loop {
+        let sel_count = selected.iter().filter(|&&s| s).count();
+        terminal.draw(|frame| {
+            let area = frame.area();
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .margin(1)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Min(5),
+                    Constraint::Length(3),
+                ])
+                .split(area);
+
+            let header = Paragraph::new(Line::from(vec![
+                Span::styled("Select ", label_style()),
+                Span::styled(limit.to_string(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(" domains (Space=toggle, Enter=confirm)", label_style()),
+                Span::raw(format!("  [{}/{}]", sel_count, limit)),
+            ])).block(Block::default().borders(Borders::ALL).title(" DeltaSpoof — AutoSpoof Domain Selection "));
+            frame.render_widget(header, chunks[0]);
+
+            let rows: Vec<Row> = entries.iter().enumerate().map(|(i, e)| {
+                let mark = if selected[i] { "[x]" } else { "[ ]" };
+                let style = if selected[i] {
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                Row::new(vec![
+                    Cell::from(mark).style(style),
+                    Cell::from(e.score.to_string()),
+                    Cell::from(e.sni.clone()),
+                    Cell::from(e.ip.to_string()),
+                ])
+            }).collect();
+            let widths = [Constraint::Length(5), Constraint::Length(6), Constraint::Min(20), Constraint::Length(16)];
+            let table = Table::new(rows, widths)
+                .header(Row::new(vec!["", "Score", "SNI", "IP"]).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)))
+                .block(Block::default().borders(Borders::ALL).title(format!(" Domains ({}/{}) ", sel_count, limit)));
+            frame.render_stateful_widget(table, chunks[1], &mut state);
+
+            let footer = Paragraph::new(Line::from(vec![
+                Span::styled("Space", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled(" toggle  ", label_style()),
+                Span::styled("Enter", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::styled(" confirm  ", label_style()),
+                Span::styled("q/Esc", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                Span::styled(" quit", label_style()),
+            ])).block(Block::default().borders(Borders::ALL));
+            frame.render_widget(footer, chunks[2]);
+        })?;
+
+        if event::poll(Duration::from_millis(200))? {
+            if let Event::Key(k) = event::read()? {
+                if k.kind != KeyEventKind::Press {
+                    continue;
+                }
+                match k.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        let i = state.selected().unwrap_or(0);
+                        state.select(Some(i.saturating_sub(1)));
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        let i = state.selected().unwrap_or(0);
+                        state.select(Some((i + 1).min(entries.len() - 1)));
+                    }
+                    KeyCode::Char(' ') => {
+                        let i = state.selected().unwrap_or(0);
+                        if selected[i] {
+                            selected[i] = false;
+                        } else if selected.iter().filter(|&&s| s).count() < limit {
+                            selected[i] = true;
+                        }
+                    }
+                    KeyCode::Enter => {
+                        let result: Vec<SniProbeEntry> = entries.iter().zip(&selected)
+                            .filter(|(_, s)| **s)
+                            .map(|(e, _)| e.clone())
+                            .collect();
+                        if result.is_empty() {
+                            // Default to top N.
+                            return Ok(entries.iter().take(limit).cloned().collect());
+                        }
+                        return Ok(result);
+                    }
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
+                        return Ok(entries.iter().take(limit).cloned().collect());
                     }
                     _ => {}
                 }
@@ -869,10 +986,11 @@ pub fn run_dashboard(
     let active_sni = match info {
         DashboardInfo::SniSpoof { sni, ip, score } => Some((sni.clone(), *ip, *score)),
         DashboardInfo::FindIp { sni, domain_ip, .. } => Some((sni.clone(), *domain_ip, 0)),
+        DashboardInfo::AutoSpoof { domains, .. } => Some((domains.first().cloned().unwrap_or_default(), Ipv4Addr::new(0,0,0,0), 0)),
         DashboardInfo::IpBypass { .. } | DashboardInfo::IpBypassPlus { .. } => None,
     };
     let active_ip = match info {
-        DashboardInfo::SniSpoof { .. } | DashboardInfo::FindIp { .. } => None,
+        DashboardInfo::SniSpoof { .. } | DashboardInfo::FindIp { .. } | DashboardInfo::AutoSpoof { .. } => None,
         DashboardInfo::IpBypass { ip } | DashboardInfo::IpBypassPlus { ip } => Some(*ip),
     };
     let mut state = DashboardState {
@@ -1126,7 +1244,7 @@ fn draw_dashboard(
         };
         let uptime = fmt_uptime(state.start.elapsed());
         let header_lines = match info {
-            DashboardInfo::SniSpoof { .. } | DashboardInfo::FindIp { .. } => {
+            DashboardInfo::SniSpoof { .. } | DashboardInfo::FindIp { .. } | DashboardInfo::AutoSpoof { .. } => {
                 let (sni, ip, _score) = state
                     .active_sni
                     .as_ref()
@@ -1142,6 +1260,22 @@ fn draw_dashboard(
                         ("find_ip", vec![
                             Span::styled("Max IPs: ", label_style()),
                             Span::styled(max_ip.to_string(), Style::default().fg(Color::White)),
+                            Span::raw("   "),
+                            Span::styled("Timeout: ", label_style()),
+                            Span::styled(format!("{}s", cfg.IP_TEST_TIMEOUT_SECS), Style::default().fg(Color::White)),
+                        ])
+                    }
+                    DashboardInfo::AutoSpoof { max_ip, max_domain, domains, .. } => {
+                        let conns = max_ip * max_domain;
+                        ("auto_spoof", vec![
+                            Span::styled("IPs: ", label_style()),
+                            Span::styled(max_ip.to_string(), Style::default().fg(Color::White)),
+                            Span::raw("   "),
+                            Span::styled("Domains: ", label_style()),
+                            Span::styled(max_domain.to_string(), Style::default().fg(Color::Cyan)),
+                            Span::raw("   "),
+                            Span::styled("Connections: ", label_style()),
+                            Span::styled(conns.to_string(), Style::default().fg(Color::Green)),
                             Span::raw("   "),
                             Span::styled("Timeout: ", label_style()),
                             Span::styled(format!("{}s", cfg.IP_TEST_TIMEOUT_SECS), Style::default().fg(Color::White)),

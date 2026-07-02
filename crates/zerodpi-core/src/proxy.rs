@@ -1513,6 +1513,167 @@ impl Default for CycleManagerStats {
     }
 }
 
+/// Maintains up to `MAX_IP` concurrent outbound connections to multiple domains
+/// simultaneously.  Each IP connects to ALL domains.  VPN traffic is distributed
+/// across IPs using round-robin; domain assignment is also round-robin.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_auto_spoof_proxy(
+    cfg: Arc<Config>,
+    domains: Vec<String>,
+    candidate_ips: Vec<IpAddr>,
+    pool: Arc<RwLock<IpPool>>,
+    byte_counters: IpByteCounters,
+    event_tx: Option<ProxyEventSender>,
+    find_ip_event_tx: Option<FindIpEventSender>,
+    stats: Arc<std::sync::Mutex<CycleManagerStats>>,
+) -> anyhow::Result<()> {
+    let listen_addr: SocketAddr = format!("{}:{}", cfg.LISTEN_HOST, cfg.LISTEN_PORT)
+        .parse()
+        .context("invalid LISTEN_HOST/LISTEN_PORT")?;
+    let listener = TcpListener::bind(listen_addr)
+        .await
+        .with_context(|| format!("bind {listen_addr}"))?;
+    info!(%listen_addr, domains = ?domains, "auto_spoof: listening");
+
+    let max_ip = cfg.MAX_IP;
+    let cycle_secs = cfg.IP_TEST_TIMEOUT_SECS;
+    let scan_sni: Arc<str> = Arc::from(cfg.IP_SCAN_SNI.as_str());
+    let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
+
+    // Start cycle manager.
+    let cycle_cfg = cfg.clone();
+    let cycle_pool = pool.clone();
+    let cycle_counters = byte_counters.clone();
+    let cycle_candidates = candidate_ips.clone();
+    let cycle_find_tx = find_ip_event_tx.clone();
+    let cycle_stats = stats.clone();
+    let cycle_domains = domains.clone();
+    tokio::spawn(async move {
+        auto_spoof_cycle_manager(
+            cycle_cfg, cycle_pool, cycle_counters, cycle_candidates,
+            cycle_find_tx, cycle_domains, scan_sni, scan_timeout,
+            max_ip, cycle_secs, cycle_stats,
+        )
+        .await;
+    });
+
+    // Domain round-robin index.
+    let domain_idx = std::sync::atomic::AtomicUsize::new(0);
+
+    loop {
+        let (incoming, peer) = match listener.accept().await {
+            Ok(x) => x,
+            Err(e) => {
+                warn!(error = %e, "auto_spoof: accept failed");
+                continue;
+            }
+        };
+        debug!(%peer, "auto_spoof: accepted");
+
+        // Round-robin: pick the next IP and next domain.
+        let connect_ip = {
+            let mut p = pool.write().unwrap();
+            match p.next_ip() {
+                Some(ip) => ip,
+                None => {
+                    warn!("auto_spoof: pool empty, dropping connection");
+                    continue;
+                }
+            }
+        };
+        let dom_idx = domain_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % domains.len();
+        let connect_sni = domains[dom_idx].clone();
+
+        let connect_addr = SocketAddr::new(connect_ip, CONNECT_PORT);
+        let src_port = peer.port();
+        let ev_tx = event_tx.clone();
+
+        emit(&ev_tx, ProxyEvent::ConnectionAccepted { peer, src_port });
+
+        byte_counters.inc_connection(&connect_ip);
+        let upload_counter = byte_counters.get_upload(&connect_ip);
+        let download_counter = byte_counters.get_download(&connect_ip);
+        let cycle_upload = byte_counters.cycle_upload.entry(connect_ip).or_insert_with(|| Arc::new(AtomicU64::new(0))).clone();
+        let cycle_download = byte_counters.cycle_download.entry(connect_ip).or_insert_with(|| Arc::new(AtomicU64::new(0))).clone();
+
+        let relay_max_lifetime = configured_relay_max_lifetime(&cfg);
+
+        tokio::spawn(async move {
+            let outgoing = match TcpStream::connect(connect_addr).await {
+                Ok(s) => s,
+                Err(e) => {
+                    emit(&ev_tx, ProxyEvent::ConnectionError { src_port, error: e.to_string() });
+                    return;
+                }
+            };
+            emit(&ev_tx, ProxyEvent::BypassComplete { src_port, outcome: BypassOutcome::FakeDataAcked });
+
+            let (inc_rd, inc_wr) = incoming.into_split();
+            let (out_rd, out_wr) = outgoing.into_split();
+            let mut c2s_task = tokio::spawn(copy_counting_dual(inc_rd, out_wr, upload_counter.clone(), cycle_upload));
+            let mut s2c_task = tokio::spawn(copy_counting_dual(out_rd, inc_wr, download_counter.clone(), cycle_download));
+
+            if let Some(max_lifetime) = relay_max_lifetime {
+                let mut c2s_done: Option<u64> = None;
+                let mut s2c_done: Option<u64> = None;
+                let deadline = tokio::time::sleep(max_lifetime);
+                tokio::pin!(deadline);
+                loop {
+                    tokio::select! {
+                        _ = &mut deadline => {
+                            if c2s_done.is_none() { c2s_task.abort(); }
+                            if s2c_done.is_none() { s2c_task.abort(); }
+                            break;
+                        }
+                        r = &mut c2s_task, if c2s_done.is_none() => {
+                            c2s_done = Some(r.unwrap_or(0));
+                            if c2s_done.is_some() && s2c_done.is_some() { break; }
+                        }
+                        r = &mut s2c_task, if s2c_done.is_none() => {
+                            s2c_done = Some(r.unwrap_or(0));
+                            if c2s_done.is_some() && s2c_done.is_some() { break; }
+                        }
+                    }
+                }
+            } else {
+                let _ = tokio::join!(c2s_task, s2c_task);
+            }
+        });
+    }
+}
+
+/// Cycle manager for auto_spoof mode.  Same logic as find_ip_cycle_manager
+/// but logs with "auto_spoof" prefix.
+async fn auto_spoof_cycle_manager(
+    cfg: Arc<Config>,
+    pool: Arc<RwLock<IpPool>>,
+    byte_counters: IpByteCounters,
+    candidate_ips: Vec<IpAddr>,
+    find_ip_event_tx: Option<FindIpEventSender>,
+    domains: Vec<String>,
+    scan_sni: Arc<str>,
+    scan_timeout: Duration,
+    max_ip: usize,
+    cycle_secs: u64,
+    stats: Arc<std::sync::Mutex<CycleManagerStats>>,
+) {
+    // Delegate to the same cycle logic as find_ip — the pool tracks IPs,
+    // and the proxy tracks domain assignment independently.
+    let cmc = CycleManagerConfig {
+        cfg,
+        candidate_ips,
+        pool,
+        byte_counters,
+        find_ip_event_tx,
+        scan_sni,
+        scan_timeout,
+        max_ip,
+        cycle_secs,
+        stats,
+    };
+    find_ip_cycle_manager(cmc).await;
+}
+
 /// Background cycle manager for find_ip mode.
 ///
 /// Every `cycle_secs` seconds, evaluates bytes per IP, removes dead IPs,

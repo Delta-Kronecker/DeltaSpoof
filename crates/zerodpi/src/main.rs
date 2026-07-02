@@ -35,7 +35,7 @@ use zerodpi_core::ip_scanner::{load_ip_list, scan_ip_list, IpProbeEntry, IpScanE
 use zerodpi_core::methods::build_method;
 use zerodpi_core::net::default_interface_ipv4;
 use zerodpi_core::proxy::{
-    new_ip_byte_counters, run_find_ip_proxy, run_ip_bypass_plus_proxy, run_ip_bypass_proxy,
+    new_ip_byte_counters, run_auto_spoof_proxy, run_find_ip_proxy, run_ip_bypass_plus_proxy, run_ip_bypass_proxy,
     run_proxy, ActiveSniTarget, CycleManagerStats, FindIpEvent, IpPool, ProxyEvent,
     ProxyEventSender, RelayEndReason, CONNECT_PORT,
 };
@@ -238,6 +238,15 @@ fn main() -> Result<()> {
             .enable_all()
             .build()?;
         return find_ip_main(cfg_clone, cfg_path_clone, rt, no_tui);
+    }
+
+    if cfg.MODE == "auto_spoof" {
+        let cfg_clone = cfg.clone();
+        let cfg_path_clone = cfg_path.clone();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        return auto_spoof_main(cfg_clone, cfg_path_clone, rt, no_tui);
     }
 
     // ---- branch: scan-only modes ----
@@ -1469,6 +1478,316 @@ fn find_ip_main(
                         if let Some(h) = proxy_handle.take() { h.abort(); }
                         return Err(e);
                     }
+                }
+            }
+        }
+    }
+}
+
+fn auto_spoof_main(
+    cfg: Arc<Config>,
+    cfg_path: PathBuf,
+    rt: tokio::runtime::Runtime,
+    no_tui: bool,
+) -> Result<()> {
+    let max_domain = cfg.MAX_DOMAIN;
+    let max_ip = cfg.MAX_IP;
+
+    let sni_list_path = {
+        let raw = PathBuf::from(&cfg.SNI_LIST);
+        if raw.is_absolute() {
+            raw
+        } else {
+            cfg_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join(raw)
+        }
+    };
+    let ip_list_path = {
+        let raw = PathBuf::from(&cfg.IP_LIST);
+        if raw.is_absolute() {
+            raw
+        } else {
+            cfg_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join(raw)
+        }
+    };
+
+    let mut selected_range: Option<ipnet::IpNet> = None;
+    let mut proxy_handle: Option<tokio::task::JoinHandle<anyhow::Result<()>>> = None;
+
+    loop {
+        // ---- PHASE 1: SNI scan → select top N domains ----
+        let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
+
+        let sorted_entries: Vec<SniProbeEntry> = if let Some(ref forced_sni) = cfg.SELECTED_SNI {
+            info!(sni = %forced_sni, "auto_spoof: SELECTED_SNI set — skipping scan");
+            let sni = forced_sni.clone();
+            rt.block_on(async move { resolve_single_sni(&sni).await })
+                .with_context(|| format!("resolving SELECTED_SNI '{}'", forced_sni))?
+        } else {
+            info!(path = %sni_list_path.display(), max_domain, "auto_spoof: scanning SNI list");
+            let path = sni_list_path.clone();
+            let cfg_clone = cfg.clone();
+            let entries = if no_tui {
+                let entries = rt.block_on(scan_sni_list(&path, scan_timeout, cfg_clone, None, None))?;
+                log_sni_scan_results("auto_spoof: headless scan", &entries);
+                entries
+            } else {
+                rt.block_on(async move {
+                    scan_sni_list_with_progress(cfg_clone, &path, scan_timeout).await
+                })?
+            };
+            if entries.is_empty() {
+                anyhow::bail!(
+                    "auto_spoof: no reachable SNI candidates found in {}",
+                    sni_list_path.display()
+                );
+            }
+            entries
+        };
+
+        let selected_domains: Vec<SniProbeEntry> = if cfg.AUTO_SELECT || cfg.SELECTED_SNI.is_some() || no_tui {
+            let domains: Vec<SniProbeEntry> = sorted_entries.into_iter().take(max_domain).collect();
+            for d in &domains {
+                info!(sni = %d.sni, ip = %d.ip, score = d.score, "auto_spoof: selected domain");
+            }
+            domains
+        } else {
+            let mut terminal = tui::enter_tui()?;
+            let result = tui::run_multi_domain_selection(&mut terminal, &sorted_entries, max_domain);
+            tui::leave_tui(terminal)?;
+            match result {
+                Ok(entries) => entries,
+                Err(e) => return Err(e).context("auto_spoof: domain selection"),
+            }
+        };
+
+        if selected_domains.is_empty() {
+            anyhow::bail!("auto_spoof: no domains selected");
+        }
+
+        let domain_names: Vec<String> = selected_domains.iter().map(|e| e.sni.clone()).collect();
+        info!(domains = ?domain_names, "auto_spoof: using {} domains", domain_names.len());
+
+        // ---- PHASE 2: CIDR selection ----
+        let cidr_ranges: Vec<ipnet::IpNet> = {
+            let text = std::fs::read_to_string(&ip_list_path)
+                .with_context(|| format!("auto_spoof: reading ip_list from '{}'", ip_list_path.display()))?;
+            text.lines()
+                .filter(|l| {
+                    let l = l.trim();
+                    !l.is_empty() && !l.starts_with('#')
+                })
+                .filter_map(|l| l.trim().parse::<ipnet::IpNet>().ok())
+                .collect()
+        };
+
+        if cidr_ranges.is_empty() {
+            anyhow::bail!(
+                "auto_spoof: no CIDR ranges found in '{}'",
+                ip_list_path.display()
+            );
+        }
+
+        selected_range = Some(if no_tui {
+            info!("auto_spoof: auto-selecting first CIDR range");
+            cidr_ranges[0]
+        } else {
+            let mut terminal = tui::enter_tui()?;
+            let result = tui::run_cidr_selection(&mut terminal, &cidr_ranges);
+            tui::leave_tui(terminal)?;
+            result.context("auto_spoof: CIDR selection")?
+        });
+
+        let range = selected_range.unwrap();
+        info!(range = %range, "auto_spoof: selected CIDR range");
+
+        let candidate_ips: Vec<IpAddr> = range.hosts().collect();
+        info!(count = candidate_ips.len(), "auto_spoof: expanded CIDR to IPs");
+
+        if candidate_ips.is_empty() {
+            anyhow::bail!("auto_spoof: selected CIDR expanded to 0 IPs");
+        }
+
+        // ---- PHASE 3: IP scan with first domain's SNI ----
+        let scan_sni: Arc<str> = Arc::from(selected_domains[0].sni.as_str());
+        let scan_timeout = Duration::from_secs(cfg.SCAN_TIMEOUT_SECS);
+
+        info!("auto_spoof: scanning IPs with SNI = {}", selected_domains[0].sni);
+
+        let ip_scan_results: Vec<IpProbeEntry> = if no_tui {
+            let results = rt.block_on(scan_ip_list(
+                candidate_ips.clone(),
+                scan_sni.clone(),
+                scan_timeout,
+                cfg.clone(),
+                None,
+            ));
+            log_ip_scan_results("auto_spoof: IP scan", &results);
+            results
+        } else {
+            let (tx, mut rx) = mpsc::unbounded_channel::<IpScanEvent>();
+            let cfg_clone = cfg.clone();
+            let candidates_clone = candidate_ips.clone();
+            let scan_sni_clone = scan_sni.clone();
+            let scan_handle = rt.spawn(async move {
+                scan_ip_list(candidates_clone, scan_sni_clone, scan_timeout, cfg_clone, Some(tx)).await
+            });
+
+            let mut terminal = tui::enter_tui()?;
+            let total_ips = candidate_ips.len();
+            let (arrived, _aborted, range_changed) = tui::run_ip_scan_progress(&mut terminal, &mut rx, total_ips, max_ip * 2)?;
+            tui::leave_tui(terminal)?;
+
+            if range_changed {
+                scan_handle.abort();
+                info!("auto_spoof: user requested range change");
+                continue;
+            }
+
+            let sorted = if scan_handle.is_finished() {
+                rt.block_on(scan_handle).context("auto_spoof: scanner panicked")?
+            } else {
+                scan_handle.abort();
+                let mut e = arrived;
+                e.sort_by(|a, b| b.score.cmp(&a.score).then(
+                    a.tcp_latency_ms.unwrap_or(u64::MAX).cmp(&b.tcp_latency_ms.unwrap_or(u64::MAX)),
+                ));
+                e
+            };
+
+            info!("auto_spoof: IP scan complete — {} candidates", sorted.len());
+            for e in &sorted {
+                info!("{}", e.summary_line());
+            }
+            sorted
+        };
+
+        if ip_scan_results.is_empty() {
+            anyhow::bail!("auto_spoof: no IPs passed the scan");
+        }
+
+        // Save results to JSON.
+        let output_path_str = cfg.SCAN_OUTPUT.as_deref().unwrap_or("auto-spoof-results.json");
+        let output_path = {
+            let raw = PathBuf::from(output_path_str);
+            if raw.is_absolute() {
+                raw
+            } else {
+                cfg_path
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .join(raw)
+            }
+        };
+        let json = serde_json::to_string_pretty(&ip_scan_results)
+            .context("auto_spoof: serializing scan results")?;
+        std::fs::write(&output_path, &json)
+            .with_context(|| format!("auto_spoof: writing results to '{}'", output_path.display()))?;
+        info!(path = %output_path.display(), "auto_spoof: scan results saved");
+
+        // ---- PHASE 4: Initialize pool and start proxy ----
+        let initial_ips: Vec<IpAddr> = ip_scan_results
+            .iter()
+            .take(max_ip)
+            .map(|e| e.ip)
+            .collect();
+        let total_connections = initial_ips.len() * domain_names.len();
+        info!(ips = initial_ips.len(), domains = domain_names.len(), total_connections, "auto_spoof: starting proxy");
+
+        if let Some(h) = proxy_handle.take() {
+            h.abort();
+        }
+
+        let pool = Arc::new(std::sync::RwLock::new(IpPool::new(initial_ips)));
+        let byte_counters = new_ip_byte_counters();
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<ProxyEvent>();
+        let (find_ip_event_tx, mut find_ip_event_rx) = mpsc::unbounded_channel::<FindIpEvent>();
+
+        let interface_ip = default_interface_ipv4(selected_domains[0].ip)
+            .context("auto_spoof: could not determine local interface IP")?;
+        info!(%interface_ip, "auto_spoof: starting proxy on {}", cfg.LISTEN_PORT);
+
+        let proxy_cfg = cfg.clone();
+        let proxy_domains = domain_names.clone();
+        let proxy_candidates = candidate_ips.clone();
+        let proxy_pool = pool.clone();
+        let proxy_counters = byte_counters.clone();
+        let proxy_stats = Arc::new(std::sync::Mutex::new(CycleManagerStats::new()));
+
+        proxy_handle = Some(rt.spawn(async move {
+            run_auto_spoof_proxy(
+                proxy_cfg,
+                proxy_domains,
+                proxy_candidates,
+                proxy_pool,
+                proxy_counters,
+                Some(event_tx),
+                Some(find_ip_event_tx),
+                proxy_stats,
+            )
+            .await
+        }));
+
+        // ---- PHASE 5: Dashboard loop ----
+        if no_tui {
+            info!("auto_spoof: running headless; send SIGTERM to stop");
+            let result = rt.block_on(async {
+                tokio::select! {
+                    result = proxy_handle.as_mut().unwrap() => {
+                        result.context("auto_spoof: proxy task panicked")?
+                    }
+                }
+            });
+            info!("auto_spoof: shutting down");
+            return result;
+        }
+
+        loop {
+            let dash_info = tui::DashboardInfo::AutoSpoof {
+                domains: domain_names.clone(),
+                max_ip,
+                max_domain: domain_names.len(),
+            };
+            let mut terminal = tui::enter_tui()?;
+            let dash_action = tui::run_find_ip_dashboard(
+                &mut terminal,
+                &mut event_rx,
+                &mut find_ip_event_rx,
+                &dash_info,
+                &cfg,
+                &pool,
+                &byte_counters,
+            );
+            tui::leave_tui(terminal)?;
+
+            match dash_action {
+                Ok(tui::FindIpAction::Quit) => {
+                    if let Some(h) = proxy_handle.take() { h.abort(); }
+                    info!("auto_spoof: shutting down");
+                    return Ok(());
+                }
+                Ok(tui::FindIpAction::ChangeDomain) => {
+                    if let Some(h) = proxy_handle.take() { h.abort(); }
+                    info!("auto_spoof: changing domains");
+                    break;
+                }
+                Ok(tui::FindIpAction::ChangeRange) => {
+                    if let Some(h) = proxy_handle.take() { h.abort(); }
+                    info!("auto_spoof: changing range");
+                    break;
+                }
+                Ok(tui::FindIpAction::StopAndPick) => {
+                    info!("auto_spoof: IP picking not applicable in auto mode");
+                }
+                Err(e) => {
+                    if let Some(h) = proxy_handle.take() { h.abort(); }
+                    return Err(e);
                 }
             }
         }

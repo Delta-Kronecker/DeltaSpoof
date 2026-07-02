@@ -442,7 +442,7 @@ pub struct Config {
     pub PROXY_TEST_SPEED_CAP_BPS: f64,
 
     // -----------------------------------------------------------------------
-    // find_ip mode
+    // find_ip / auto_spoof mode
     // -----------------------------------------------------------------------
     /// Maximum number of concurrent IP connections maintained in the find_ip
     /// live proxy pool.  The proxy distributes VPN traffic across up to this
@@ -451,6 +451,13 @@ pub struct Config {
     /// Default: `10`.
     #[serde(default = "default_max_ip")]
     pub MAX_IP: usize,
+
+    /// Number of domains to serve simultaneously in auto_spoof mode.
+    /// Each IP in the pool connects to ALL domains, so total connections
+    /// = MAX_IP × MAX_DOMAIN.  In find_ip mode this is always 1.
+    /// Default: `1`.
+    #[serde(default = "default_max_domain")]
+    pub MAX_DOMAIN: usize,
 
     /// Seconds per evaluation cycle in find_ip mode.  Every this many seconds
     /// the proxy evaluates bytes per IP, removes dead connections, and replaces
@@ -591,6 +598,9 @@ fn default_proxy_speed_cap_bps() -> f64 {
 fn default_max_ip() -> usize {
     10
 }
+fn default_max_domain() -> usize {
+    1
+}
 fn default_ip_test_timeout() -> u64 {
     10
 }
@@ -676,9 +686,10 @@ impl Config {
                 | "ip_scan"
                 | "proxy_scan"
                 | "find_ip"
+                | "auto_spoof"
         ) {
             anyhow::bail!(
-                "Unknown MODE '{}'. Valid values: \"sni_spoof\", \"ip_bypass\", \"ip_bypass_plus\", \"sni_scan\", \"ip_scan\", \"proxy_scan\", \"find_ip\"",
+                "Unknown MODE '{}'. Valid values: \"sni_spoof\", \"ip_bypass\", \"ip_bypass_plus\", \"sni_scan\", \"ip_scan\", \"proxy_scan\", \"find_ip\", \"auto_spoof\"",
                 self.MODE
             );
         }
